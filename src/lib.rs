@@ -1,34 +1,34 @@
 use anyhow::bail;
+use deepsize::DeepSizeOf;
 use quinn::RecvStream;
 use tokio::io::AsyncReadExt;
 use tracing::instrument;
+use uuid::Uuid;
 
 pub const MESSAGE_LENGTH_LIMIT: u64 = 128000000; // Bytes
 
 pub mod server {
     use std::{
         collections::HashMap,
-        net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+        net::{Ipv6Addr, SocketAddrV6},
         path::PathBuf,
         sync::Arc,
         time::Duration,
     };
 
-    use anyhow::bail;
-    use dashmap::DashMap;
     use quinn::{
         rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-        Endpoint, RecvStream, SendStream, ServerConfig,
+        Endpoint, ServerConfig,
     };
-    use tokio::{
-        io::AsyncReadExt,
-        select,
-        sync::broadcast::{Receiver, Sender},
-    };
+    use tokio::{fs, io::AsyncReadExt, select};
     use tokio_util::sync::CancellationToken;
     use tracing::{event, span, Level};
+    use uuid::Uuid;
 
-    use crate::{read_message_length, Message, MessageType};
+    use crate::{
+        client::FileTree, read_message_length, FileReponseHeader, Message, Sendable,
+        MESSAGE_LENGTH_LIMIT,
+    };
 
     /// Creates a custom ```(ServerConfig, CertificateDer<'static>)``` instance. The Certificate is insecure.
     pub fn configure_server() -> anyhow::Result<(ServerConfig, CertificateDer<'static>)> {
@@ -49,7 +49,9 @@ pub mod server {
     pub fn start_server(
         port: u16,
         cancellation_token: CancellationToken,
-    ) -> anyhow::Result<ServerInstance> {
+        shared_files: HashMap<String, PathBuf>,
+        file_tree: Vec<FileTree>,
+    ) -> anyhow::Result<()> {
         #[cfg(not(debug_assertions))]
         let addr = Ipv6Addr::UNSPECIFIED;
 
@@ -63,21 +65,21 @@ pub mod server {
             std::net::SocketAddr::V6(SocketAddrV6::new(addr, port, 0, 0)),
         )?;
 
-        let shared_files: Arc<DashMap<String, PathBuf>> = Arc::new(DashMap::new());
+        spawn_service_workers(
+            shared_files.clone(),
+            Arc::new(endpoint),
+            cancellation_token,
+            file_tree,
+        );
 
-        spawn_service_workers(shared_files.clone(), Arc::new(endpoint), cancellation_token);
-
-        let server_instace = ServerInstance {
-            client_list: shared_files,
-        };
-
-        Ok(server_instace)
+        Ok(())
     }
 
     pub fn spawn_service_workers(
-        shared_files: Arc<DashMap<String, PathBuf>>,
+        shared_files: HashMap<String, PathBuf>,
         endpoint: Arc<Endpoint>,
         cancellation_token: CancellationToken,
+        file_tree: Vec<FileTree>,
     ) {
         let client_conn_span = span!(Level::WARN, "client_connector");
         let server_sender_span = span!(Level::WARN, "server_sender");
@@ -97,7 +99,9 @@ pub mod server {
                         if let Ok(connecting) = incoming_conn.accept() {
                             event!(Level::INFO, "Accepted connection from: {}", remote_addr);
                             if let Ok(connection) = connecting.await {
-                                let (send_stream, mut recv_stream) = connection.accept_bi().await.unwrap();
+                                let (mut send_stream, mut recv_stream) = connection.accept_bi().await.unwrap();
+
+                                let _ = recv_stream.read_exact(&mut vec![0; 1]).await;
 
                                 event!(
                                     Level::INFO,
@@ -107,17 +111,27 @@ pub mod server {
 
                                 let (send, mut recv) = tokio::sync::mpsc::channel::<Message>(1000);
 
-                                // Enter client span
+                                // Enter span
                                 let _span = client_listn_span.enter();
 
                                 let cancellation_token_clone_1 = cancellation_token.clone();
                                 let cancellation_token_clone_2 = cancellation_token.clone();
 
+                                //Send file tree automaticly
+                                if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileTreeResponse(file_tree.clone()))).to_sendable()).await {
+                                    event!(Level::ERROR, "Error occured while writing to client ({remote_addr}) stream: {err}");
+                                }
+
                                 // Spawn client listener
                                 tokio::spawn(async move {
                                     loop {
                                         select! {
-                                            _ = cancellation_token_clone_1.cancelled() => break,
+                                            _ = cancellation_token_clone_1.cancelled() => {
+                                                event!(Level::INFO, "Client listener shut down: ({remote_addr})");
+
+                                                break
+                                            },
+
                                             Ok(message_length) = read_message_length(&mut recv_stream) => {
                                                 let mut buf = vec![0; message_length as usize];
 
@@ -125,7 +139,7 @@ pub mod server {
                                                     event!(Level::ERROR, "Error occured while reading from client ({remote_addr}) stream: {err}");
                                                 }
 
-                                                match serde_json::from_slice::<Message>(&buf) {
+                                                match Message::try_from(buf.as_slice()) {
                                                     Ok(message) => {
                                                         send.send(message).await.unwrap();
                                                     },
@@ -138,7 +152,11 @@ pub mod server {
                                     }
                                 });
 
+                                // Enter span
                                 let _spawn = server_sender_span.enter();
+                                let shared_files = shared_files.clone();
+                                let file_tree = file_tree.clone();
+
                                 // Spawn client sender
                                 tokio::spawn(async move {
                                     loop {
@@ -146,7 +164,55 @@ pub mod server {
                                             _ = cancellation_token_clone_2.cancelled() => break,
 
                                             Some(received_message) = recv.recv() => {
+                                                if let Message(Some(message)) = received_message.clone() {
+                                                    match message {
+                                                        crate::MessageType::FileTreeRequest => {
+                                                            if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileTreeResponse(file_tree.clone()))).to_sendable()).await {
+                                                                event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                            }
+                                                        },
+                                                        crate::MessageType::FileRequest(file_hash) => {
+                                                            if let Some(file_path) = shared_files.get(&file_hash) {
+                                                                let bytes = fs::read(file_path).await.unwrap();
 
+                                                                let byte_packets = bytes.chunks(MESSAGE_LENGTH_LIMIT as usize);
+
+                                                                let packet_hashes: Vec<String> = byte_packets.clone().map(sha256::digest).collect();
+
+                                                                let parent_header_id = Uuid::new_v4();
+
+                                                                let file_header = FileReponseHeader {
+                                                                    total_size: bytes.len(),
+                                                                    file_packets: packet_hashes.clone(),
+                                                                    file_packet_count: byte_packets.len(),
+                                                                    uuid: parent_header_id.to_string(),
+                                                                };
+
+                                                                //Send header
+                                                                if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header))).to_sendable()).await {
+                                                                    event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                }
+
+                                                                //Send packets
+                                                                for (idx, packet) in byte_packets.enumerate() {
+                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket { packet_id: packet_hashes[idx].clone(), parent_id: parent_header_id.to_string(), bytes: packet.to_vec() }))).to_sendable()).await {
+                                                                        event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        crate::MessageType::KeepAlive => {
+                                                            //Echo back to client
+                                                            if let Err(err) = send_stream.write_all(&received_message.to_sendable()).await {
+                                                                event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                            }
+
+                                                        }
+                                                        crate::MessageType::FileTreeResponse(_) => unreachable!(),
+                                                        crate::MessageType::FileResponse(_) => unreachable!(),
+                                                        crate::MessageType::FilePacket(_) => unreachable!(),
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -166,43 +232,156 @@ pub mod server {
                 }
             }
         });
-        tokio::spawn(async move {});
-    }
-
-    /// This struct contains a HashMap of hashes and the paired ```PathBuf```s
-    pub struct FileList(HashMap<String, PathBuf>);
-
-    pub struct RemoteClient {
-        recv: tokio::sync::mpsc::Receiver<Message>,
-        send: tokio::sync::mpsc::Sender<Message>,
-    }
-
-    pub struct ServerInstance {
-        pub client_list: Arc<DashMap<String, PathBuf>>,
     }
 }
 
 pub mod client {
-    use std::sync::Arc;
+    use std::{net::Ipv6Addr, sync::Arc, time::Duration};
 
+    use deepsize::DeepSizeOf;
     use quinn::{
+        crypto::rustls::QuicClientConfig,
         rustls::{
             self,
             pki_types::{CertificateDer, ServerName, UnixTime},
         },
-        RecvStream, SendStream,
+        ClientConfig, Endpoint, RecvStream,
     };
+    use tokio::{
+        io::AsyncReadExt,
+        select,
+        sync::mpsc::{channel, Receiver, Sender},
+    };
+    use tokio_util::sync::CancellationToken;
+    use tracing::{event, Level};
+
+    use crate::{read_message_length, Message, MessageType, Sendable};
 
     pub struct ConnectionInstance {
-        recv: RecvStream,
-        send: SendStream,
+        pub file_trees: Vec<FileTree>,
+        pub from_server_recv: Receiver<Message>,
+        pub to_server_send: Sender<Message>,
+        pub service_cancellation: CancellationToken,
     }
 
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
+    pub async fn connect_to_server(address: String) -> anyhow::Result<ConnectionInstance> {
+        let mut endpoint = Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into())?;
+
+        endpoint.set_default_client_config(ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(SkipServerVerification::new())
+                    .with_no_client_auth(),
+            )?,
+        )));
+
+        let client: quinn::Connection = endpoint.connect(address.parse()?, "localhost")?.await?;
+
+        let (mut send_stream, mut recv_stream) = client.clone().open_bi().await?;
+
+        //Send empty packet
+        let _ = send_stream.write(&vec![0]).await;
+
+        //Begin conversation
+        //Read file tree automaticly sent by server
+        let message_length = recv_stream.read_u64().await?;
+
+        let mut buf = vec![0; message_length as usize];
+
+        recv_stream.read_exact(&mut buf).await?;
+
+        let message = Message::try_from(buf.as_slice())?;
+
+        if let Some(MessageType::FileTreeResponse(file_tree)) = message.0 {
+            // The service uses `to_server_listener` to listen for messages coming from `to_server_send` (From the front end to the async task to be sent to the server)
+            let (to_server_send, mut to_server_listener) = channel::<Message>(1000);
+
+            // The service uses `from_server_send` to send messages to `from_server_listener` (To the front end, the non-async main thread to be interpreted by the client)
+            let (from_server_send, from_server_listener) = channel::<Message>(1000);
+            let cancellation_token = CancellationToken::new();
+
+            let listener_cancellation_token_clone = cancellation_token.clone();
+            let sender_cancellation_token_clone = cancellation_token.clone();
+
+            //Spawn client communicator service handlers
+            //Listener
+            tokio::spawn(async move {
+                loop {
+                    select! {
+                        _ = listener_cancellation_token_clone.cancelled() => break,
+
+                        message_header = read_message_length(&mut recv_stream) => {
+                            match message_header {
+                                Ok(header_length) => {
+                                    match handle_incoming_message(header_length as usize, &mut recv_stream).await  {
+                                        Ok(message) => {
+                                            from_server_send.send(message).await.unwrap();
+                                        },
+                                        Err(err) => {
+                                            event!(Level::ERROR, "Received invalid input from server: {err}")
+                                        },
+                                    }
+                                },
+                                Err(err) => {
+                                    event!(Level::ERROR, "Error occured while reading from the server, if it has timed out after inactivity this is expected.: {err}");
+                                },
+                            }
+                        }
+                    }
+                }
+            });
+
+            //Sender
+            tokio::spawn(async move {
+                loop {
+                    select! {
+                        _ = sender_cancellation_token_clone.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                            if let Err(err) = send_stream.write_all(&Message(Some(MessageType::KeepAlive)).to_sendable()).await {
+                                event!(Level::ERROR, "Error occured while trying to write to the server: {err}");
+                            }
+                        }
+                        Some(message) = to_server_listener.recv() => {
+                            if let Err(err) = send_stream.write_all(&message.to_sendable()).await {
+                                event!(Level::ERROR, "Error occured while trying to write to the server: {err}");
+                            }
+                        },
+                    }
+                }
+            });
+
+            return Ok(ConnectionInstance {
+                file_trees: file_tree,
+                from_server_recv: from_server_listener,
+                to_server_send,
+                service_cancellation: cancellation_token,
+            });
+        } else {
+            return Err(anyhow::Error::msg(
+                "Received invalid data exchange from server.",
+            ));
+        }
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
     pub enum FileTree {
         Folder((String, Vec<FileTree>)),
         File((String, String)),
         Empty,
+    }
+
+    async fn handle_incoming_message(
+        header_length: usize,
+        recv_stream: &mut RecvStream,
+    ) -> anyhow::Result<Message> {
+        let mut buf = vec![0; header_length];
+
+        recv_stream.read_exact(&mut buf).await?;
+
+        let message = Message::try_from(buf.as_slice())?;
+
+        Ok(message)
     }
 
     /// Custom certificate, this doesnt verify anything I should implement a working one.
@@ -262,20 +441,64 @@ pub mod client {
     }
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct Message(Option<MessageType>);
+#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+pub struct Message(pub Option<MessageType>);
 
-#[derive(serde::Deserialize, serde::Serialize)]
-enum MessageType {
-    FileTreeRequest(Vec<client::FileTree>),
+#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+pub enum MessageType {
+    FileTreeRequest,
     FileRequest(String),
+
+    FileResponse(FileReponseHeader),
+    FileTreeResponse(Vec<client::FileTree>),
+    FilePacket(FilePacket),
+    KeepAlive,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+pub struct FileReponseHeader {
+    pub total_size: usize,
+    pub uuid: String,
+    pub file_packets: Vec<String>,
+    pub file_packet_count: usize,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+pub struct FilePacket {
+    pub packet_id: String,
+    pub parent_id: String,
+    pub bytes: Vec<u8>,
+}
+
+trait Sendable {
+    fn to_sendable(self) -> Vec<u8>;
+}
+
+impl Sendable for Message {
+    fn to_sendable(self) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::with_capacity(size_of::<usize>() + size_of::<Self>());
+        let mut message = rmp_serde::to_vec(&self).unwrap();
+
+        buf.append(&mut message.len().to_be_bytes().to_vec());
+        buf.append(&mut message);
+
+        buf
+    }
+}
+
+impl TryFrom<&[u8]> for Message {
+    type Error = rmp_serde::decode::Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        rmp_serde::from_slice(&value)
+    }
 }
 
 #[instrument]
 pub async fn read_message_length(recv: &mut RecvStream) -> anyhow::Result<u64> {
     let message_length = recv.read_u64().await?;
 
-    if message_length > MESSAGE_LENGTH_LIMIT {
+    if dbg!(message_length) > MESSAGE_LENGTH_LIMIT {
         bail!("Message length is too long, rejecting request.");
     } else {
         Ok(message_length)
