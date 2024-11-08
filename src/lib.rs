@@ -1,6 +1,5 @@
 use anyhow::bail;
 use quinn::RecvStream;
-use strum::EnumDiscriminants;
 use tokio::io::AsyncReadExt;
 use tracing::instrument;
 use uuid::Uuid;
@@ -186,6 +185,7 @@ pub mod server {
                                                                 let parent_header_id = Uuid::new_v4();
 
                                                                 let file_header = FileReponseHeader {
+                                                                    file_name: file_path.file_name().unwrap().to_string_lossy().to_string(),
                                                                     file_hash: file_hash.clone(),
                                                                     total_size: file_metadata.len(),
                                                                     file_packets: vec![],
@@ -462,7 +462,7 @@ pub mod client {
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct Message(pub Option<MessageType>);
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, EnumDiscriminants)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub enum MessageType {
     FileTreeRequest,
     FileRequest(String),
@@ -475,6 +475,7 @@ pub enum MessageType {
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct FileReponseHeader {
+    pub file_name: String,
     pub file_hash: String,
     pub total_size: u64,
     pub uuid: String,

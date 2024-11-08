@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fs, io::Write, path::PathBuf, thread};
 
 use egui::{vec2, Color32, RichText, Ui};
+use egui_notify::{Toast, Toasts};
 use file_sharing::{
     client::{connect_to_server, ConnectionInstance, FileTree},
     server::start_server,
@@ -13,6 +14,9 @@ use uuid::Uuid;
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Application {
+    #[serde(skip)]
+    pub toasts: Toasts,
+
     #[serde(skip)]
     pub server_instance: Option<()>,
     #[serde(skip)]
@@ -47,6 +51,7 @@ impl Default for Application {
     fn default() -> Self {
         let (connection_sender, connection_reciver) = channel(100);
         Self {
+            toasts: Toasts::new(),
             server_instance: None,
             connection_instance: None,
             file_trees: Vec::new(),
@@ -81,6 +86,8 @@ impl eframe::App for Application {
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.toasts.show(ctx);
+        
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.connection_instance.is_none(), |ui| {
@@ -225,6 +232,10 @@ impl eframe::App for Application {
 
                                         should_delete_row = _header.file_packet_count as usize
                                             == packet_hash_list.len();
+
+                                        if should_delete_row {
+                                            self.toasts.add(Toast::success(format!("{} has finished downloading.", _header.file_name)));
+                                        }
 
                                         if let Some(save_path) =
                                             self.download_location.get(&packet.file_hash)

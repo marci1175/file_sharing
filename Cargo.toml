@@ -27,4 +27,4 @@ sha256 = "1.5.0"
 uuid = {version = "1.11.0", features = ["serde", "v4", "fast-rng"]}
 tracing-subscriber = "0.3.18"
 rmp-serde = "1.3.0"
-strum = {version = "0.26.3", features = ["derive"]}
+egui-notify = "0.17.0"
