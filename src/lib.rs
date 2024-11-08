@@ -1,6 +1,6 @@
 use anyhow::bail;
-use deepsize::DeepSizeOf;
 use quinn::RecvStream;
+use strum::EnumDiscriminants;
 use tokio::io::AsyncReadExt;
 use tracing::instrument;
 use uuid::Uuid;
@@ -20,7 +20,11 @@ pub mod server {
         rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
         Endpoint, ServerConfig,
     };
-    use tokio::{fs, io::AsyncReadExt, select};
+    use tokio::{
+        fs::{self, File},
+        io::{AsyncReadExt, AsyncSeekExt},
+        select,
+    };
     use tokio_util::sync::CancellationToken;
     use tracing::{event, span, Level};
     use uuid::Uuid;
@@ -173,29 +177,38 @@ pub mod server {
                                                         },
                                                         crate::MessageType::FileRequest(file_hash) => {
                                                             if let Some(file_path) = shared_files.get(&file_hash) {
-                                                                let bytes = fs::read(file_path).await.unwrap();
+                                                                let mut file_handle = File::open(file_path).await.unwrap();
 
-                                                                let byte_packets = bytes.chunks(MESSAGE_LENGTH_LIMIT as usize);
+                                                                let file_metadata = file_handle.metadata().await.unwrap();
 
-                                                                let packet_hashes: Vec<String> = byte_packets.clone().map(sha256::digest).collect();
-
+                                                                let packet_length = MESSAGE_LENGTH_LIMIT / 2;
+                                                                let packet_count = file_metadata.len() / packet_length + 1;
                                                                 let parent_header_id = Uuid::new_v4();
 
                                                                 let file_header = FileReponseHeader {
-                                                                    total_size: bytes.len(),
-                                                                    file_packets: packet_hashes.clone(),
-                                                                    file_packet_count: byte_packets.len(),
+                                                                    file_hash: file_hash.clone(),
+                                                                    total_size: file_metadata.len(),
+                                                                    file_packets: vec![],
+                                                                    file_packet_count: packet_count,
                                                                     uuid: parent_header_id.to_string(),
                                                                 };
 
-                                                                //Send header
                                                                 if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header))).to_sendable()).await {
                                                                     event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                 }
 
-                                                                //Send packets
-                                                                for (idx, packet) in byte_packets.enumerate() {
-                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket { packet_id: packet_hashes[idx].clone(), parent_id: parent_header_id.to_string(), bytes: packet.to_vec() }))).to_sendable()).await {
+                                                                for packet_number in 0..packet_count {
+                                                                    let mut buf = if packet_number + 1 == packet_count || file_metadata.len() < packet_length {
+                                                                        let cursor_pos = file_handle.stream_position().await.unwrap();
+                                                                        vec![0; (file_metadata.len() - cursor_pos) as usize]
+                                                                    }
+                                                                    else {
+                                                                        vec![0; packet_length as usize]
+                                                                    };
+
+                                                                    file_handle.read_exact(&mut buf).await.unwrap();
+
+                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket { file_hash: file_hash.clone(), packet_id: packet_number as usize, parent_id: parent_header_id.to_string(), bytes: buf }))).to_sendable()).await {
                                                                         event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                     }
                                                                 }
@@ -238,7 +251,7 @@ pub mod server {
 pub mod client {
     use std::{net::Ipv6Addr, sync::Arc, time::Duration};
 
-    use deepsize::DeepSizeOf;
+    use egui::Context;
     use quinn::{
         crypto::rustls::QuicClientConfig,
         rustls::{
@@ -264,7 +277,10 @@ pub mod client {
         pub service_cancellation: CancellationToken,
     }
 
-    pub async fn connect_to_server(address: String) -> anyhow::Result<ConnectionInstance> {
+    pub async fn connect_to_server(
+        address: String,
+        ctx: Context,
+    ) -> anyhow::Result<ConnectionInstance> {
         let mut endpoint = Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into())?;
 
         endpoint.set_default_client_config(ClientConfig::new(Arc::new(
@@ -317,6 +333,7 @@ pub mod client {
                                     match handle_incoming_message(header_length as usize, &mut recv_stream).await  {
                                         Ok(message) => {
                                             from_server_send.send(message).await.unwrap();
+                                            ctx.request_repaint();
                                         },
                                         Err(err) => {
                                             event!(Level::ERROR, "Received invalid input from server: {err}")
@@ -325,6 +342,7 @@ pub mod client {
                                 },
                                 Err(err) => {
                                     event!(Level::ERROR, "Error occured while reading from the server, if it has timed out after inactivity this is expected.: {err}");
+                                    panic!()
                                 },
                             }
                         }
@@ -364,7 +382,7 @@ pub mod client {
         }
     }
 
-    #[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+    #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
     pub enum FileTree {
         Folder((String, Vec<FileTree>)),
         File((String, String)),
@@ -441,10 +459,10 @@ pub mod client {
     }
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct Message(pub Option<MessageType>);
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, EnumDiscriminants)]
 pub enum MessageType {
     FileTreeRequest,
     FileRequest(String),
@@ -455,17 +473,19 @@ pub enum MessageType {
     KeepAlive,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct FileReponseHeader {
-    pub total_size: usize,
+    pub file_hash: String,
+    pub total_size: u64,
     pub uuid: String,
     pub file_packets: Vec<String>,
-    pub file_packet_count: usize,
+    pub file_packet_count: u64,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, DeepSizeOf, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct FilePacket {
-    pub packet_id: String,
+    pub file_hash: String,
+    pub packet_id: usize,
     pub parent_id: String,
     pub bytes: Vec<u8>,
 }
@@ -498,7 +518,7 @@ impl TryFrom<&[u8]> for Message {
 pub async fn read_message_length(recv: &mut RecvStream) -> anyhow::Result<u64> {
     let message_length = recv.read_u64().await?;
 
-    if dbg!(message_length) > MESSAGE_LENGTH_LIMIT {
+    if message_length > MESSAGE_LENGTH_LIMIT {
         bail!("Message length is too long, rejecting request.");
     } else {
         Ok(message_length)

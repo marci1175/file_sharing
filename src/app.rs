@@ -36,7 +36,11 @@ pub struct Application {
     #[serde(skip)]
     pub connection_sender: Sender<ConnectionInstance>,
 
-    pub download_header_list: HashMap<String, (FileReponseHeader, Vec<String>)>,
+    #[serde(skip)]
+    pub download_header_list: HashMap<String, (FileReponseHeader, Vec<usize>)>,
+
+    #[serde(skip)]
+    pub download_location: HashMap<String, PathBuf>,
 }
 
 impl Default for Application {
@@ -54,6 +58,7 @@ impl Default for Application {
             connection_sender,
             remote_address: String::new(),
             download_header_list: HashMap::new(),
+            download_location: HashMap::new(),
         }
     }
 }
@@ -155,10 +160,12 @@ impl eframe::App for Application {
 
                     let remote_address = self.remote_address.clone();
 
+                    let ctx = ctx.clone();
+
                     ui.add_enabled_ui(self.connection_instance.is_none(), |ui| {
                         if ui.button("Connect").clicked() {
                             tokio::spawn(async move {
-                                match connect_to_server(remote_address).await {
+                                match connect_to_server(remote_address, ctx).await {
                                     Ok(connection_instance) => {
                                         connection_sender.send(connection_instance).await.unwrap();
                                     }
@@ -177,58 +184,69 @@ impl eframe::App for Application {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if let Some(file_hash) = display_file_tree(ui, self.file_trees.clone()) {
-                        if let Some(connection_instance) = &mut self.connection_instance {
-                            if let Err(err) = connection_instance.to_server_send.try_send(Message(
-                                Some(file_sharing::MessageType::FileRequest(file_hash)),
-                            )) {
-                                display_error(err);
+                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone());
+                    if let Some(connection_instance) = &mut self.connection_instance {
+                        if let Some((file_hash, file_name)) = clicked_file_hash {
+                            let (file_name, file_extension) = file_name.split_at(file_name.find('.').unwrap_or_default());
+                            if let Some(save_location) = rfd::FileDialog::new().set_file_name(file_name).add_filter(file_extension, &[file_extension[1..].to_string()]).save_file() {
+                                //backup temp path
+                                self.download_location
+                                    .insert(file_hash.clone(), save_location);
+
+                                if let Err(err) =
+                                    connection_instance.to_server_send.try_send(Message(Some(
+                                        file_sharing::MessageType::FileRequest(file_hash),
+                                    )))
+                                {
+                                    display_error(err);
+                                }
                             }
+                        }
 
-                            if let Ok(Message(Some(message))) =
-                                connection_instance.from_server_recv.try_recv()
-                            {
-                                match message {
-                                    file_sharing::MessageType::FileResponse(
-                                        file_reponse_header,
-                                    ) => {
-                                        self.download_header_list.insert(
-                                            file_reponse_header.uuid.clone(),
-                                            (file_reponse_header, vec![]),
-                                        );
-                                    }
-                                    file_sharing::MessageType::FilePacket(packet) => {
-                                        let mut should_delete_row = false;
+                        if let Ok(Message(Some(message))) =
+                            connection_instance.from_server_recv.try_recv()
+                        {
+                            match message {
+                                file_sharing::MessageType::FileResponse(file_reponse_header) => {
+                                    self.download_header_list.insert(
+                                        file_reponse_header.uuid.clone(),
+                                        (file_reponse_header, vec![]),
+                                    );
+                                }
+                                file_sharing::MessageType::FilePacket(packet) => {
+                                    let mut should_delete_row = false;
 
-                                        let packet_id = packet.parent_id;
+                                    let packet_id = packet.parent_id;
 
-                                        if let Some((_header, packet_hash_list)) =
-                                            self.download_header_list.get_mut(&packet_id)
+                                    if let Some((_header, packet_hash_list)) =
+                                        self.download_header_list.get_mut(&packet_id)
+                                    {
+                                        packet_hash_list.push(packet.packet_id);
+
+                                        should_delete_row = _header.file_packet_count as usize
+                                            == packet_hash_list.len();
+
+                                        if let Some(save_path) =
+                                            self.download_location.get(&packet.file_hash)
                                         {
-                                            should_delete_row =
-                                                _header.file_packet_count == packet_hash_list.len();
-
-                                            packet_hash_list.push(packet.packet_id);
-
-                                            dbg!(packet_hash_list.len());
-
                                             if let Ok(mut file) = fs::OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open(_header.uuid.to_string())
+                                            .create(true)
+                                            .append(true)
+                                            .open(save_path)
                                             {
                                                 file.write(&packet.bytes).unwrap();
                                             }
                                         }
-
-                                        if should_delete_row {
-                                            self.download_header_list.remove(&packet_id);
-                                        }
                                     }
-                                    file_sharing::MessageType::KeepAlive => (),
 
-                                    _ => unreachable!(),
+                                    if should_delete_row {
+                                        self.download_header_list.remove(&packet_id);
+                                        self.download_location.remove(&packet.file_hash);
+                                    }
                                 }
+                                file_sharing::MessageType::KeepAlive => (),
+
+                                _ => unreachable!(),
                             }
                         }
                     }
@@ -250,17 +268,17 @@ fn display_error(err: impl ToString) {
         .show();
 }
 
-pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<String> {
+pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<(String, String)> {
     for file_tree in file_trees {
         match &file_tree {
             FileTree::Folder((name, file_list)) => {
-                if let Some(Some(file_hash)) = ui
+                if let Some(Some(file_attr)) = ui
                     .collapsing(name, |ui| {
                         for entry in file_list {
                             match display_file_tree(ui, vec![entry.clone()]) {
                                 //If it's `Some()` it means a button has been pushed and we can return the value
-                                Some(file_hash) => {
-                                    return Some(file_hash);
+                                Some(file_attr) => {
+                                    return Some(file_attr);
                                 }
                                 //If it is none we dont want to return to iter over the other elements
                                 None => (),
@@ -270,12 +288,12 @@ pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<Strin
                     })
                     .body_returned
                 {
-                    return Some(file_hash);
+                    return Some(file_attr);
                 }
             }
             FileTree::File((file_name, file_hash)) => {
                 if ui.button(file_name).clicked() {
-                    return Some(file_hash.to_string());
+                    return Some((file_hash.to_string(), file_name.to_string()));
                 };
             }
             FileTree::Empty => {
