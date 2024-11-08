@@ -274,12 +274,12 @@ pub mod client {
         pub file_trees: Vec<FileTree>,
         pub from_server_recv: Receiver<Message>,
         pub to_server_send: Sender<Message>,
-        pub service_cancellation: CancellationToken,
     }
 
     pub async fn connect_to_server(
         address: String,
         ctx: Context,
+        cancellation_token: CancellationToken,
     ) -> anyhow::Result<ConnectionInstance> {
         let mut endpoint = Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into())?;
 
@@ -315,7 +315,6 @@ pub mod client {
 
             // The service uses `from_server_send` to send messages to `from_server_listener` (To the front end, the non-async main thread to be interpreted by the client)
             let (from_server_send, from_server_listener) = channel::<Message>(1000);
-            let cancellation_token = CancellationToken::new();
 
             let listener_cancellation_token_clone = cancellation_token.clone();
             let sender_cancellation_token_clone = cancellation_token.clone();
@@ -373,7 +372,6 @@ pub mod client {
                 file_trees: file_tree,
                 from_server_recv: from_server_listener,
                 to_server_send,
-                service_cancellation: cancellation_token,
             });
         } else {
             return Err(anyhow::Error::msg(

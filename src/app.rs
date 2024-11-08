@@ -9,7 +9,6 @@ use file_sharing::{
 };
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -29,6 +28,7 @@ pub struct Application {
 
     pub shared_folders: Vec<PathBuf>,
 
+    #[serde(skip)]
     pub shared_files: HashMap<String, PathBuf>,
 
     #[serde(skip)]
@@ -45,12 +45,16 @@ pub struct Application {
 
     #[serde(skip)]
     pub download_location: HashMap<String, PathBuf>,
+
+    #[serde(skip)]
+    client_cancellation_token: CancellationToken,
 }
 
 impl Default for Application {
     fn default() -> Self {
         let (connection_sender, connection_reciver) = channel(100);
         Self {
+            client_cancellation_token: CancellationToken::new(),
             toasts: Toasts::new(),
             server_instance: None,
             connection_instance: None,
@@ -90,73 +94,72 @@ impl eframe::App for Application {
         
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.connection_instance.is_none(), |ui| {
-                    ui.menu_button("Host", |ui| {
-                        ui.add_enabled_ui(self.server_instance.is_none(), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Port");
-                                ui.text_edit_singleline(&mut self.port_buf);
-                            });
+                ui.menu_button("Host", |ui| {
+                    ui.add_enabled_ui(self.server_instance.is_none(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Port");
+                            ui.text_edit_singleline(&mut self.port_buf);
+                        });
 
-                            ui.label("Selected folders:");
+                        ui.label("Selected folders:");
 
-                            ui.allocate_ui(vec2(200., 200.), |ui| {
-                                egui::ScrollArea::new([true, true]).show(ui, |ui| {
-                                    for path in &self.shared_folders {
-                                        ui.label(format!("{}", path.display()));
-                                    }
-                                });
-                            });
-
-                            if ui.button("Select folder").clicked() {
-                                if let Some(paths) = rfd::FileDialog::new().pick_folders() {
-                                    if let Ok((file_trees, shared_files)) =
-                                        folder_into_file_tree(paths.clone())
-                                    {
-                                        self.shared_folders = paths.clone();
-
-                                        self.file_trees = file_trees;
-                                        self.shared_files = shared_files;
-                                    }
-                                }
-                            }
-
-                            let port_parse: Result<u16, std::num::ParseIntError> =
-                                self.port_buf.parse();
-                            let could_parse = port_parse.is_ok();
-
-                            if !could_parse {
-                                ui.label(
-                                    RichText::from("Invalid port!")
-                                        .color(Color32::RED)
-                                        .size(10.),
-                                );
-                            }
-
-                            ui.add_enabled_ui(could_parse, |ui| {
-                                if ui.button("Host").clicked() {
-                                    if let Err(err) = start_server(
-                                        port_parse.unwrap(),
-                                        self.server_cancellation_token.clone(),
-                                        self.shared_files.clone(),
-                                        self.file_trees.clone(),
-                                    ) {
-                                        display_error(err);
-                                    } else {
-                                        self.server_instance = Some(());
-                                    }
+                        ui.allocate_ui(vec2(200., 200.), |ui| {
+                            egui::ScrollArea::new([true, true]).show(ui, |ui| {
+                                for path in &self.shared_folders {
+                                    ui.label(format!("{}", path.display()));
                                 }
                             });
                         });
-                        ui.add_enabled_ui(self.server_instance.is_some(), |ui| {
-                            if ui
-                                .button(RichText::from("Shutdown").color(Color32::RED))
-                                .clicked()
-                            {
-                                self.server_cancellation_token.cancel();
-                                self.server_instance = None;
+
+                        if ui.button("Select folder").clicked() {
+                            if let Some(paths) = rfd::FileDialog::new().pick_folders() {
+                                if let Ok((file_trees, shared_files)) =
+                                    folder_into_file_tree(paths.clone())
+                                {
+                                    self.shared_folders = paths.clone();
+
+                                    self.file_trees = file_trees;
+                                    self.shared_files = shared_files;
+                                }
+                            }
+                        }
+
+                        let port_parse: Result<u16, std::num::ParseIntError> =
+                            self.port_buf.parse();
+                        let could_parse = port_parse.is_ok();
+
+                        if !could_parse {
+                            ui.label(
+                                RichText::from("Invalid port!")
+                                    .color(Color32::RED)
+                                    .size(10.),
+                            );
+                        }
+
+                        ui.add_enabled_ui(could_parse, |ui| {
+                            if ui.button("Host").clicked() {
+                                if let Err(err) = start_server(
+                                    port_parse.unwrap(),
+                                    self.server_cancellation_token.clone(),
+                                    self.shared_files.clone(),
+                                    self.file_trees.clone(),
+                                ) {
+                                    display_error(err);
+                                } else {
+                                    self.server_instance = Some(());
+                                }
                             }
                         });
+                    });
+                    ui.add_enabled_ui(self.server_instance.is_some(), |ui| {
+                        if ui
+                            .button(RichText::from("Shutdown").color(Color32::RED))
+                            .clicked()
+                        {
+                            self.server_cancellation_token.cancel();
+                            self.server_instance = None;
+                            self.server_cancellation_token = CancellationToken::new();
+                        }
                     });
                 });
 
@@ -168,11 +171,11 @@ impl eframe::App for Application {
                     let remote_address = self.remote_address.clone();
 
                     let ctx = ctx.clone();
-
+                    let client_cancellation_token = self.client_cancellation_token.clone();
                     ui.add_enabled_ui(self.connection_instance.is_none(), |ui| {
                         if ui.button("Connect").clicked() {
                             tokio::spawn(async move {
-                                match connect_to_server(remote_address, ctx).await {
+                                match connect_to_server(remote_address, ctx, client_cancellation_token).await {
                                     Ok(connection_instance) => {
                                         connection_sender.send(connection_instance).await.unwrap();
                                     }
@@ -181,6 +184,14 @@ impl eframe::App for Application {
                                     }
                                 }
                             });
+                        }
+                    });
+
+                    ui.add_enabled_ui(self.connection_instance.is_some(), |ui| {
+                        if ui.button(RichText::from("Disconnect").color(Color32::RED)).clicked() {
+                            self.client_cancellation_token.cancel();
+                            self.connection_instance = None;
+                            self.client_cancellation_token = CancellationToken::new();
                         }
                     });
                 });
