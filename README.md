@@ -7,7 +7,7 @@
   - Interactive Ui
   - Can easily be made secure with Ceritificates
 ### Techstack:
-  - Ui: Egui
+  - Ui: egui & egui-notify
   - Backend: tokio-rs
   - Diagnostic information: tracing
   - Networking: quinn (A QUIC implmentation)
