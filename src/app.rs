@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::Write, path::PathBuf, thread};
+use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
 use egui::{vec2, Color32, RichText, Ui};
 use egui_notify::{Toast, Toasts};
@@ -91,7 +91,7 @@ impl eframe::App for Application {
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.toasts.show(ctx);
-        
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("Host", |ui| {
@@ -175,7 +175,13 @@ impl eframe::App for Application {
                     ui.add_enabled_ui(self.connection_instance.is_none(), |ui| {
                         if ui.button("Connect").clicked() {
                             tokio::spawn(async move {
-                                match connect_to_server(remote_address, ctx, client_cancellation_token).await {
+                                match connect_to_server(
+                                    remote_address,
+                                    ctx,
+                                    client_cancellation_token,
+                                )
+                                .await
+                                {
                                     Ok(connection_instance) => {
                                         connection_sender.send(connection_instance).await.unwrap();
                                     }
@@ -188,7 +194,10 @@ impl eframe::App for Application {
                     });
 
                     ui.add_enabled_ui(self.connection_instance.is_some(), |ui| {
-                        if ui.button(RichText::from("Disconnect").color(Color32::RED)).clicked() {
+                        if ui
+                            .button(RichText::from("Disconnect").color(Color32::RED))
+                            .clicked()
+                        {
                             self.client_cancellation_token.cancel();
                             self.connection_instance = None;
                             self.client_cancellation_token = CancellationToken::new();
@@ -205,8 +214,13 @@ impl eframe::App for Application {
                     let clicked_file_hash = display_file_tree(ui, self.file_trees.clone());
                     if let Some(connection_instance) = &mut self.connection_instance {
                         if let Some((file_hash, file_name)) = clicked_file_hash {
-                            let (file_name, file_extension) = file_name.split_at(file_name.find('.').unwrap_or_default());
-                            if let Some(save_location) = rfd::FileDialog::new().set_file_name(file_name).add_filter(file_extension, &[file_extension[1..].to_string()]).save_file() {
+                            let (file_name, file_extension) =
+                                file_name.split_at(file_name.find('.').unwrap_or_default());
+                            if let Some(save_location) = rfd::FileDialog::new()
+                                .set_file_name(file_name)
+                                .add_filter(file_extension, &[file_extension[1..].to_string()])
+                                .save_file()
+                            {
                                 //backup temp path
                                 self.download_location
                                     .insert(file_hash.clone(), save_location);
@@ -245,16 +259,19 @@ impl eframe::App for Application {
                                             == packet_hash_list.len();
 
                                         if should_delete_row {
-                                            self.toasts.add(Toast::success(format!("{} has finished downloading.", _header.file_name)));
+                                            self.toasts.add(Toast::success(format!(
+                                                "{} has finished downloading.",
+                                                _header.file_name
+                                            )));
                                         }
 
                                         if let Some(save_path) =
                                             self.download_location.get(&packet.file_hash)
                                         {
                                             if let Ok(mut file) = fs::OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open(save_path)
+                                                .create(true)
+                                                .append(true)
+                                                .open(save_path)
                                             {
                                                 file.write(&packet.bytes).unwrap();
                                             }
@@ -297,13 +314,8 @@ pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<(Stri
                 if let Some(Some(file_attr)) = ui
                     .collapsing(name, |ui| {
                         for entry in file_list {
-                            match display_file_tree(ui, vec![entry.clone()]) {
-                                //If it's `Some()` it means a button has been pushed and we can return the value
-                                Some(file_attr) => {
-                                    return Some(file_attr);
-                                }
-                                //If it is none we dont want to return to iter over the other elements
-                                None => (),
+                            if let Some(file_attr) = display_file_tree(ui, vec![entry.clone()]) {
+                                return Some(file_attr);
                             }
                         }
                         None

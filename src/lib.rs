@@ -2,7 +2,6 @@ use anyhow::bail;
 use quinn::RecvStream;
 use tokio::io::AsyncReadExt;
 use tracing::instrument;
-use uuid::Uuid;
 
 pub const MESSAGE_LENGTH_LIMIT: u64 = 128000000; // Bytes
 
@@ -20,7 +19,7 @@ pub mod server {
         Endpoint, ServerConfig,
     };
     use tokio::{
-        fs::{self, File},
+        fs::{File},
         io::{AsyncReadExt, AsyncSeekExt},
         select,
     };
@@ -104,7 +103,7 @@ pub mod server {
                             if let Ok(connection) = connecting.await {
                                 let (mut send_stream, mut recv_stream) = connection.accept_bi().await.unwrap();
 
-                                let _ = recv_stream.read_exact(&mut vec![0; 1]).await;
+                                let _ = recv_stream.read_exact(&mut [0; 1]).await;
 
                                 event!(
                                     Level::INFO,
@@ -297,7 +296,7 @@ pub mod client {
         let (mut send_stream, mut recv_stream) = client.clone().open_bi().await?;
 
         //Send empty packet
-        let _ = send_stream.write(&vec![0]).await;
+        let _ = send_stream.write(&[0]).await;
 
         //Begin conversation
         //Read file tree automaticly sent by server
@@ -368,15 +367,15 @@ pub mod client {
                 }
             });
 
-            return Ok(ConnectionInstance {
+            Ok(ConnectionInstance {
                 file_trees: file_tree,
                 from_server_recv: from_server_listener,
                 to_server_send,
-            });
+            })
         } else {
-            return Err(anyhow::Error::msg(
+            Err(anyhow::Error::msg(
                 "Received invalid data exchange from server.",
-            ));
+            ))
         }
     }
 
@@ -509,7 +508,7 @@ impl TryFrom<&[u8]> for Message {
     type Error = rmp_serde::decode::Error;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        rmp_serde::from_slice(&value)
+        rmp_serde::from_slice(value)
     }
 }
 
