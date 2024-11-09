@@ -19,7 +19,7 @@ pub mod server {
         Endpoint, ServerConfig,
     };
     use tokio::{
-        fs::{File},
+        fs::File,
         io::{AsyncReadExt, AsyncSeekExt},
         select,
     };
@@ -207,7 +207,7 @@ pub mod server {
 
                                                                     file_handle.read_exact(&mut buf).await.unwrap();
 
-                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket { file_hash: file_hash.clone(), packet_id: packet_number as usize, parent_id: parent_header_id.to_string(), bytes: buf }))).to_sendable()).await {
+                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket {file_hash:file_hash.clone(),packet_id:packet_number as usize,parent_id:parent_header_id.to_string(), bytes_length: buf.len(), bytes:buf }))).to_sendable()).await {
                                                                         event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                     }
                                                                 }
@@ -379,7 +379,7 @@ pub mod client {
         }
     }
 
-    #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+    #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
     pub enum FileTree {
         Folder((String, Vec<FileTree>)),
         File((String, String)),
@@ -394,7 +394,17 @@ pub mod client {
 
         recv_stream.read_exact(&mut buf).await?;
 
-        let message = Message::try_from(buf.as_slice())?;
+        let mut message = Message::try_from(buf.as_slice())?;
+
+        if let Some(MessageType::FilePacket(file_packet)) = &mut message.0 {
+            let file_bytes_length = file_packet.bytes_length;
+
+            let mut buf = vec![0; file_bytes_length];
+
+            recv_stream.read_exact(&mut buf).await?;
+
+            file_packet.bytes = buf;
+        }
 
         Ok(message)
     }
@@ -485,6 +495,7 @@ pub struct FilePacket {
     pub file_hash: String,
     pub packet_id: usize,
     pub parent_id: String,
+    pub bytes_length: usize,
     pub bytes: Vec<u8>,
 }
 
@@ -493,12 +504,22 @@ trait Sendable {
 }
 
 impl Sendable for Message {
-    fn to_sendable(self) -> Vec<u8> {
+    fn to_sendable(mut self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(size_of::<usize>() + size_of::<Self>());
-        let mut message = rmp_serde::to_vec(&self).unwrap();
 
-        buf.append(&mut message.len().to_be_bytes().to_vec());
-        buf.append(&mut message);
+        if let Some(MessageType::FilePacket(file_packet)) = &mut self.0 {
+            let bytes = file_packet.bytes.clone();
+
+            file_packet.bytes = vec![];
+            let message = rmp_serde::to_vec(&self).unwrap();
+            buf.extend(message.len().to_be_bytes().to_vec());
+            buf.extend(message);
+            buf.extend(bytes);
+        } else {
+            let message = rmp_serde::to_vec(&self).unwrap();
+            buf.extend(message.len().to_be_bytes().to_vec());
+            buf.extend(message);
+        }
 
         buf
     }

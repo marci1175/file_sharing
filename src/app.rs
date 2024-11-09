@@ -9,26 +9,28 @@ use file_sharing::{
 };
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
+use tracing::{event, span, Level};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Application {
-    #[serde(skip)]
-    pub toasts: Toasts,
-
-    #[serde(skip)]
-    pub server_instance: Option<()>,
-    #[serde(skip)]
-    pub connection_instance: Option<ConnectionInstance>,
-
     pub file_trees: Vec<FileTree>,
 
     pub port_buf: String,
+
     pub remote_address: String,
 
     pub shared_folders: Vec<PathBuf>,
 
     #[serde(skip)]
+    pub toasts: Toasts,
+
+    #[serde(skip)]
+    pub server_instance: Option<()>,
+
+    #[serde(skip)]
+    pub connection_instance: Option<ConnectionInstance>,
+
     pub shared_files: HashMap<String, PathBuf>,
 
     #[serde(skip)]
@@ -53,6 +55,7 @@ pub struct Application {
 impl Default for Application {
     fn default() -> Self {
         let (connection_sender, connection_reciver) = channel(100);
+
         Self {
             client_cancellation_token: CancellationToken::new(),
             toasts: Toasts::new(),
@@ -92,8 +95,18 @@ impl eframe::App for Application {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.toasts.show(ctx);
 
+        //Get the folder's item every repaint
+        if let Ok((file_trees, shared_files)) = folder_into_file_tree(self.shared_folders.clone()) {
+            if self.file_trees != file_trees {
+                self.file_trees = file_trees;
+                self.shared_files = shared_files;
+            }
+        }
+
+        //Create the top panel in the ui 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                //The "Host" menu button
                 ui.menu_button("Host", |ui| {
                     ui.add_enabled_ui(self.server_instance.is_none(), |ui| {
                         ui.horizontal(|ui| {
@@ -128,6 +141,7 @@ impl eframe::App for Application {
                             self.port_buf.parse();
                         let could_parse = port_parse.is_ok();
 
+                        //Display Error
                         if !could_parse {
                             ui.label(
                                 RichText::from("Invalid port!")
@@ -250,6 +264,8 @@ impl eframe::App for Application {
 
                                     let packet_id = packet.parent_id;
 
+                                    let _spawn = span!(Level::ERROR, "FilePacketReciver");
+
                                     if let Some((_header, packet_hash_list)) =
                                         self.download_header_list.get_mut(&packet_id)
                                     {
@@ -276,6 +292,9 @@ impl eframe::App for Application {
                                                 file.write(&packet.bytes).unwrap();
                                             }
                                         }
+                                    }
+                                    else {
+                                        event!(Level::ERROR, "Tried to receive a `FilePacket` without a `FileResponseHeader`.")
                                     }
 
                                     if should_delete_row {
