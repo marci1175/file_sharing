@@ -1,5 +1,5 @@
 ## File Sharing
-## An innovative file sharing service, which allows for direct connection built in pure rust!
+## An innovative high-performance file sharing service, which allows for direct connection built in pure rust!
 ### Great performance with over 2GBPS peak bandwidth
 ### Features :
   - Does NOT use any external service, the server and the client are all in the source code.
