@@ -6,7 +6,7 @@
   - Blazing fast downloads and uploads due to the QUIC protocol usage (Will be improved in the future for EVEN better speeds)
   - Ability to share folders, so users can download every file from the folders shared
   - Interactive Ui
-  - Can easily be made secure with Ceritificates
+  - Can easily be made secure with Ceritificates and encryption
 ### Techstack:
   - Ui: egui & egui-notify
   - Backend: tokio-rs
