@@ -189,7 +189,7 @@ pub mod server {
                                                                     total_size: file_metadata.len(),
                                                                     file_packets: vec![],
                                                                     file_packet_count: packet_count,
-                                                                    uuid: parent_header_id.to_string(),
+                                                                    packet_identificator: parent_header_id.to_string(),
                                                                 };
 
                                                                 if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header))).to_sendable()).await {
@@ -485,7 +485,7 @@ pub struct FileReponseHeader {
     pub file_name: String,
     pub file_hash: String,
     pub total_size: u64,
-    pub uuid: String,
+    pub packet_identificator: String,
     pub file_packets: Vec<String>,
     pub file_packet_count: u64,
 }

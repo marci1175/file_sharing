@@ -1,12 +1,15 @@
 use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
 use egui::{vec2, Color32, RichText, Ui};
+use egui_extras::{Column, TableBuilder};
 use egui_notify::{Toast, Toasts};
 use file_sharing::{
     client::{connect_to_server, ConnectionInstance, FileTree},
     server::start_server,
     FileReponseHeader, Message,
 };
+use indexmap::IndexMap;
+use serde_json::value::Index;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, span, Level};
@@ -42,8 +45,7 @@ pub struct Application {
     #[serde(skip)]
     pub connection_sender: Sender<ConnectionInstance>,
 
-    #[serde(skip)]
-    pub download_header_list: HashMap<String, (FileReponseHeader, Vec<usize>)>,
+    pub download_header_list: IndexMap<String, (FileReponseHeader, Vec<usize>)>,
 
     #[serde(skip)]
     pub download_location: HashMap<String, PathBuf>,
@@ -69,7 +71,7 @@ impl Default for Application {
             connection_reciver,
             connection_sender,
             remote_address: String::new(),
-            download_header_list: HashMap::new(),
+            download_header_list: IndexMap::new(),
             download_location: HashMap::new(),
         }
     }
@@ -218,6 +220,51 @@ impl eframe::App for Application {
                         }
                     });
                 });
+
+                ui.menu_button("Download history", |ui| {
+                    TableBuilder::new(ui)
+                        .resizable(true)
+                        .auto_shrink([false, false])
+                        .striped(true)
+                        .columns(Column::remainder().at_most(ctx.available_rect().width()), 4)
+                        .header(25., |mut row| {
+                            row.col(|ui| {
+                                ui.label("Download Name");
+                            });
+                            row.col(|ui| {
+                                ui.label("Download Identificator");
+                            });
+                            row.col(|ui| {
+                                ui.label("Download size (Bytes)");
+                            });
+                            row.col(|ui| {
+                                ui.label("Download packet count");
+                            });
+                        }).body(|body| {
+                            let row_heights = vec![25. as f32; self.download_header_list.len()].into_iter();
+
+                            body.heterogeneous_rows(row_heights, |mut row| {
+                                let row_idx = row.index();
+
+                                let file_header= self.download_header_list[row_idx].0.clone();
+
+                                row.col(|ui| {
+                                    ui.label(file_header.file_name);
+
+                                });
+                                row.col(|ui| {
+                                    ui.label(file_header.file_hash);
+                                });
+                                row.col(|ui| {
+                                    ui.label(file_header.total_size.to_string());
+                                });
+                                row.col(|ui| {
+                                    ui.label(file_header.file_packet_count.to_string());
+                                });
+                            });
+                        });
+                        
+                });
             });
         });
 
@@ -225,7 +272,7 @@ impl eframe::App for Application {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone());
+                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone(), self.download_header_list.clone());
                     if let Some(connection_instance) = &mut self.connection_instance {
                         if let Some((file_hash, file_name)) = clicked_file_hash {
                             let (file_name, file_extension) =
@@ -255,7 +302,7 @@ impl eframe::App for Application {
                             match message {
                                 file_sharing::MessageType::FileResponse(file_reponse_header) => {
                                     self.download_header_list.insert(
-                                        file_reponse_header.uuid.clone(),
+                                        file_reponse_header.packet_identificator.clone(),
                                         (file_reponse_header, vec![]),
                                     );
                                 }
@@ -266,13 +313,13 @@ impl eframe::App for Application {
 
                                     let _spawn = span!(Level::ERROR, "FilePacketReciver");
 
-                                    if let Some((_header, packet_hash_list)) =
+                                    if let Some((_header, packet_id_list)) =
                                         self.download_header_list.get_mut(&packet_id)
                                     {
-                                        packet_hash_list.push(packet.packet_id);
+                                        packet_id_list.push(packet.packet_id);
 
                                         should_delete_row = _header.file_packet_count as usize
-                                            == packet_hash_list.len();
+                                            == packet_id_list.len();
 
                                         if should_delete_row {
                                             self.toasts.add(Toast::success(format!(
@@ -298,7 +345,6 @@ impl eframe::App for Application {
                                     }
 
                                     if should_delete_row {
-                                        self.download_header_list.remove(&packet_id);
                                         self.download_location.remove(&packet.file_hash);
                                     }
                                 }
@@ -326,14 +372,14 @@ fn display_error(err: impl ToString) {
         .show();
 }
 
-pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<(String, String)> {
+pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>, download_list: IndexMap<String, (FileReponseHeader, Vec<usize>)>) -> Option<(String, String)> {
     for file_tree in file_trees {
         match &file_tree {
             FileTree::Folder((name, file_list)) => {
                 if let Some(Some(file_attr)) = ui
                     .collapsing(name, |ui| {
                         for entry in file_list {
-                            if let Some(file_attr) = display_file_tree(ui, vec![entry.clone()]) {
+                            if let Some(file_attr) = display_file_tree(ui, vec![entry.clone()], download_list.clone()) {
                                 return Some(file_attr);
                             }
                         }
@@ -345,9 +391,19 @@ pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>) -> Option<(Stri
                 }
             }
             FileTree::File((file_name, file_hash)) => {
-                if ui.button(file_name).clicked() {
-                    return Some((file_hash.to_string(), file_name.to_string()));
-                };
+                return ui.horizontal(|ui| {
+                    if ui.button(file_name).clicked() {
+                        return Some((file_hash.to_string(), file_name.to_string()));
+                    };
+
+                    if let Some((file_response_header, packet_number_list)) = download_list.values().find(|entry| entry.0.file_hash == *file_hash) {
+                        ui.allocate_ui(vec2(200., ui.available_height()), |ui| {
+                            ui.add(egui::ProgressBar::new(packet_number_list.len() as f32 / file_response_header.file_packet_count as f32).show_percentage().text("Progress"))
+                        });
+                    }
+
+                    None
+                }).inner;
             }
             FileTree::Empty => {
                 ui.label("Empty");
