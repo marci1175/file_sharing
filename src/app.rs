@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap, fmt::Display, fs, io::Write, path::PathBuf};
 
 use chrono::{DateTime, Local};
-use egui::{vec2, Color32, RichText, Ui};
+use egui::{vec2, Color32, Context, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_notify::{Toast, Toasts};
 use file_sharing::{
@@ -226,8 +226,7 @@ impl eframe::App for Application {
                 });
 
                 ui.menu_button("Download history", |ui| {
-                    ui.allocate_ui(vec2(300., 300.), |ui| {
-                        TableBuilder::new(ui)
+                    TableBuilder::new(ui)
                         .resizable(true)
                         .auto_shrink([true, false])
                         .striped(true)
@@ -278,7 +277,6 @@ impl eframe::App for Application {
                                 });
                             });
                         });
-                    });
                 });
             });
         });
@@ -287,7 +285,7 @@ impl eframe::App for Application {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone(), self.temporary_download_header_list.clone());
+                    let clicked_file_hash = display_file_tree(ui, ctx, self.file_trees.clone(), self.temporary_download_header_list.clone());
                     if let Some(connection_instance) = &mut self.connection_instance {
                         if let Some((file_hash, file_name)) = clicked_file_hash {
                             let (file_name, file_extension) =
@@ -311,65 +309,71 @@ impl eframe::App for Application {
                             }
                         }
 
-                        if let Ok(Message(Some(message))) =
+                        if let Ok(Message(message)) =
                             connection_instance.from_server_recv.try_recv()
                         {
-                            match message {
-                                file_sharing::MessageType::FileResponse(file_reponse_header) => {
-                                    self.temporary_download_header_list.insert(
-                                        file_reponse_header.packet_identificator.clone(),
-                                        DownloadHeader { file_response: file_reponse_header, packet_list: vec![], arrived_bytes: 0, initiated_stamp: Local::now() },
-                                    );
-                                }
-                                file_sharing::MessageType::FilePacket(packet) => {
-                                    let mut should_delete_row = false;
+                            if let Some(message) = message {
+                                match message {
+                                    file_sharing::MessageType::FileResponse(file_reponse_header) => {
+                                        self.temporary_download_header_list.insert(
+                                            file_reponse_header.packet_identificator.clone(),
+                                            DownloadHeader { file_response: file_reponse_header, packet_list: vec![], arrived_bytes: 0, initiated_stamp: Local::now() },
+                                        );
+                                    }
+                                    file_sharing::MessageType::FilePacket(packet) => {
+                                        let mut should_delete_row = false;
 
-                                    let packet_id = packet.parent_id;
+                                        let packet_id = packet.parent_id;
 
-                                    let span = span!(Level::ERROR, "FilePacketReciver");
-                                    let _enter = span.enter();
-
-                                    if let Some(download_header) =
-                                        self.temporary_download_header_list.get_mut(&packet_id)
-                                    {
-                                        download_header.packet_list.push(packet.packet_id);
-
-                                        should_delete_row = download_header.file_response.file_packet_count as usize
-                                            == download_header.packet_list.len();
-
-                                        if should_delete_row {
-                                            self.toasts.add(Toast::success(format!(
-                                                "{} has finished downloading.",
-                                                download_header.file_response.file_name
-                                            )));
-
-                                            self.completed_download_header_list.insert(packet_id.clone(), download_header.clone());
-                                        }
-
-                                        if let Some(save_path) =
-                                            self.download_location.get(&packet.file_hash)
+                                        let span = span!(Level::ERROR, "FilePacketReciver");
+                                        let _enter = span.enter();
+                                        
+                                        if let Some(download_header) =
+                                            self.temporary_download_header_list.get_mut(&packet_id)
                                         {
-                                            if let Ok(mut file) = fs::OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open(save_path)
+                                            download_header.packet_list.push(packet.packet_id);
+
+                                            should_delete_row = download_header.file_response.file_packet_count as usize
+                                                == download_header.packet_list.len();
+                                                
+                                            if should_delete_row {
+                                                self.toasts.add(Toast::success(format!(
+                                                    "{} has finished downloading.",
+                                                    download_header.file_response.file_name
+                                                )));
+                                                self.completed_download_header_list.insert(packet_id.clone(), download_header.clone());
+                                            }
+    
+                                            if let Some(save_path) =
+                                                self.download_location.get(&packet.file_hash)
                                             {
-                                                download_header.arrived_bytes += file.write(&packet.bytes).unwrap();
+                                                if let Ok(mut file) = fs::OpenOptions::new()
+                                                    .create(true)
+                                                    .append(true)
+                                                    .open(save_path)
+                                                {
+                                                    download_header.arrived_bytes += file.write(&packet.bytes).unwrap();
+                                                }
                                             }
                                         }
+                                        else {
+                                            event!(Level::ERROR, "Tried to receive a `FilePacket` without a `FileResponseHeader`.")
+                                        }
+                                        if should_delete_row {
+                                            self.download_location.remove(&packet.file_hash);
+                                            self.temporary_download_header_list.swap_remove(&packet_id);
+                                        }
                                     }
-                                    else {
-                                        event!(Level::ERROR, "Tried to receive a `FilePacket` without a `FileResponseHeader`.")
-                                    }
-
-                                    if should_delete_row {
-                                        self.download_location.remove(&packet.file_hash);
-                                        self.temporary_download_header_list.swap_remove(&packet_id);
-                                    }
+                                    file_sharing::MessageType::KeepAlive => (),
+                                    _ => unreachable!(),
                                 }
-                                file_sharing::MessageType::KeepAlive => (),
+                            }
+                            else {
+                                event!(Level::ERROR, "Received message empty `None` from server indicating an issue.");
 
-                                _ => unreachable!(),
+                                if let Err(err) = connection_instance.to_server_send.try_send(Message(Some(file_sharing::MessageType::FileTreeRequest))) {
+                                    display_error(err);
+                                }
                             }
                         }
                     }
@@ -393,6 +397,7 @@ fn display_error(err: impl ToString) {
 
 pub fn display_file_tree(
     ui: &mut Ui,
+    ctx: &Context,
     file_trees: Vec<FileTree>,
     download_list: IndexMap<String, DownloadHeader>,
 ) -> Option<(String, String)> {
@@ -402,9 +407,12 @@ pub fn display_file_tree(
                 if let Some(Some(file_attr)) = ui
                     .collapsing(name, |ui| {
                         for entry in file_list {
-                            if let Some(file_attr) =
-                                display_file_tree(ui, vec![entry.clone()], download_list.clone())
-                            {
+                            if let Some(file_attr) = display_file_tree(
+                                ui,
+                                ctx,
+                                vec![entry.clone()],
+                                download_list.clone(),
+                            ) {
                                 return Some(file_attr);
                             }
                         }
@@ -427,15 +435,32 @@ pub fn display_file_tree(
                             .find(|entry| entry.file_response.file_hash == *file_hash)
                         {
                             ui.allocate_ui(vec2(200., ui.available_height()), |ui| {
-                                ui.add(
-                                    egui::ProgressBar::new(
-                                        download_header.packet_list.len() as f32
-                                            / download_header.file_response.file_packet_count
-                                                as f32,
-                                    )
-                                    .show_percentage()
-                                    .text(calculale_bandwidth_from_date_and_bytes(download_header.arrived_bytes, download_header.initiated_stamp).to_string()),
-                                )
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::ProgressBar::new(
+                                            download_header.packet_list.len() as f32
+                                                / download_header.file_response.file_packet_count
+                                                    as f32,
+                                        )
+                                        .show_percentage()
+                                        .text(
+                                            calculale_bandwidth_from_date_and_bytes(
+                                                download_header.arrived_bytes,
+                                                download_header.initiated_stamp,
+                                            )
+                                            .to_string(),
+                                        ),
+                                    );
+
+                                    ui.label(format!(
+                                        "Elapsed {}s",
+                                        Local::now()
+                                            .signed_duration_since(download_header.initiated_stamp)
+                                            .num_seconds()
+                                    ));
+                                });
+
+                                ctx.request_repaint();
                             });
                         }
 
@@ -508,33 +533,31 @@ pub fn folder_into_file_tree(
 }
 
 pub fn calculale_bandwidth_from_date_and_bytes(bytes: usize, date: DateTime<Local>) -> Bandwidth {
-    let bytes_per_sec = bytes / (Local::now().signed_duration_since(date).num_seconds() as usize).clamp(1, usize::MAX);
+    let bytes_per_sec = bytes
+        / (Local::now().signed_duration_since(date).num_seconds() as usize).clamp(1, usize::MAX);
     let kbytes_per_sec = bytes_per_sec as f32 / 1024.;
     let mbytes_per_sec = kbytes_per_sec as f32 / 1024.;
     let mbits_per_sec = mbytes_per_sec * 8.;
-    
+
     if mbits_per_sec > 1024. {
         let gbytes_per_sec = mbytes_per_sec as f32 / 1024.;
 
         let gbits_per_sec = gbytes_per_sec * 8.;
 
-        Bandwidth::GBPS(gbits_per_sec)        
-    }
-    else if mbits_per_sec < 1. {
+        Bandwidth::GBPS(gbits_per_sec)
+    } else if mbits_per_sec < 1. {
         let kbits_per_sec = kbytes_per_sec * 8.;
 
         Bandwidth::KBPS(kbits_per_sec)
-    }
-    else {
+    } else {
         Bandwidth::MBPS(mbits_per_sec)
     }
-
-} 
+}
 
 pub enum Bandwidth {
     GBPS(f32),
     MBPS(f32),
-    KBPS(f32)
+    KBPS(f32),
 }
 
 impl Display for Bandwidth {
@@ -542,13 +565,13 @@ impl Display for Bandwidth {
         f.write_str(&match self {
             Bandwidth::GBPS(num) => {
                 format!("{num} GBPS")
-            },
+            }
             Bandwidth::MBPS(num) => {
                 format!("{num} MBPS")
-            },
+            }
             Bandwidth::KBPS(num) => {
                 format!("{num} KBPS")
-            },
+            }
         })
     }
 }

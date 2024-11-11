@@ -57,9 +57,6 @@ pub mod server {
         shared_files: HashMap<String, PathBuf>,
         file_tree: Vec<FileTree>,
     ) -> anyhow::Result<()> {
-        let span = span!(Level::DEBUG, "Server");
-        let _enter = span.enter();
-
         #[cfg(not(debug_assertions))]
         let addr = Ipv6Addr::UNSPECIFIED;
 
@@ -98,15 +95,10 @@ pub mod server {
         cancellation_token: CancellationToken,
         file_tree: Vec<FileTree>,
     ) {
-        let client_conn_span = span!(Level::WARN, "client_connector");
-        let server_sender_span = span!(Level::WARN, "server_sender");
-        let client_listn_span = span!(Level::WARN, "client_listener");
-
         let cancellation_token_clone_3 = cancellation_token.clone();
 
         // Spawn incoming connecting client listener
         tokio::spawn(async move {
-            let _span = client_conn_span.enter();
             let endpoint = endpoint.clone();
             loop {
                 select! {
@@ -127,9 +119,6 @@ pub mod server {
                                 );
 
                                 let (send, mut recv) = tokio::sync::mpsc::channel::<Message>(1000);
-
-                                // Enter span
-                                let _span = client_listn_span.enter();
 
                                 let cancellation_token_clone_1 = cancellation_token.clone();
                                 let cancellation_token_clone_2 = cancellation_token.clone();
@@ -158,7 +147,14 @@ pub mod server {
 
                                                 match Message::try_from(buf.as_slice()) {
                                                     Ok(message) => {
-                                                        event!(Level::INFO, "Received message ({message:?}) from client: {remote_addr}.");
+                                                        match &message.0 {
+                                                            Some(inner) => {
+                                                                event!(Level::DEBUG, "Received message ({inner}) from client: {remote_addr}.",);
+                                                            },
+                                                            None => {
+                                                                event!(Level::DEBUG, "Received message empty `None` from client: {remote_addr}.",);
+                                                            },
+                                                        }
                                                         send.send(message).await.unwrap();
                                                     },
                                                     Err(err) => {
@@ -171,7 +167,6 @@ pub mod server {
                                 });
 
                                 // Enter span
-                                let _spawn = server_sender_span.enter();
                                 let shared_files = shared_files.clone();
                                 let file_tree = file_tree.clone();
 
@@ -212,11 +207,12 @@ pub mod server {
                                                                     packet_identificator: parent_header_id.to_string(),
                                                                 };
 
-                                                                if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header))).to_sendable()).await {
+                                                                if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header.clone()))).to_sendable()).await {
                                                                     event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                 }
 
-                                                                event!(Level::DEBUG, "Sending {packet_count} packets of bytes. With a total of {file_length} bytes.");
+                                                                event!(Level::INFO, "Sending file header packet: {file_header:?}");
+                                                                event!(Level::INFO, "Sending {packet_count} packets of bytes. With a total of {file_length} bytes.");
 
                                                                 for packet_number in 0..packet_count {
                                                                     let mut buf = if packet_number + 1 == packet_count || file_length < packet_length {
@@ -234,7 +230,7 @@ pub mod server {
                                                                     }
                                                                 }
 
-                                                                event!(Level::DEBUG, "Finished sending all the bytes of {file_hash} for: {remote_addr}.")
+                                                                event!(Level::INFO, "Finished sending all the bytes of {file_hash} for: {remote_addr}.")
                                                             }
                                                             //If the file the client was not found we should indicate it by sending a ```None``` back.
                                                             else {
@@ -322,9 +318,24 @@ pub mod client {
             )?,
         )));
 
-        let client: quinn::Connection = endpoint.connect(address.parse()?, "localhost")?.await?;
+        let parsed_address = address.parse()?;
+
+        event!(
+            Level::INFO,
+            "Opened local endpoint at: {:?} connecting to remote address: {parsed_address}",
+            endpoint.local_addr()
+        );
+
+        let client: quinn::Connection = endpoint.connect(parsed_address, "localhost")?.await?;
+
+        event!(Level::INFO, "Opening bidirectional connection...");
 
         let (mut send_stream, mut recv_stream) = client.clone().open_bi().await?;
+
+        event!(
+            Level::INFO,
+            "Accepted bidirectional connection to {parsed_address}..."
+        );
 
         //Send empty packet
         let _ = send_stream.write(&[0]).await;
@@ -334,6 +345,8 @@ pub mod client {
         let message_length = recv_stream.read_u64().await?;
 
         let mut buf = vec![0; message_length as usize];
+
+        event!(Level::INFO, "Getting file tree...");
 
         recv_stream.read_exact(&mut buf).await?;
 
@@ -349,6 +362,8 @@ pub mod client {
             let listener_cancellation_token_clone = cancellation_token.clone();
             let sender_cancellation_token_clone = cancellation_token.clone();
 
+            event!(Level::INFO, "Starting server listener...");
+
             //Spawn client communicator service handlers
             //Listener
             tokio::spawn(async move {
@@ -361,6 +376,15 @@ pub mod client {
                                 Ok(header_length) => {
                                     match handle_incoming_message(header_length as usize, &mut recv_stream).await  {
                                         Ok(message) => {
+                                            match &message.0 {
+                                                Some(inner) => {
+                                                    event!(Level::DEBUG, "Received message ({inner}) from server.",);
+                                                },
+                                                None => {
+                                                    event!(Level::ERROR, "Received message empty `None` from server indicating an issue.");
+                                                },
+                                            }
+
                                             from_server_send.send(message).await.unwrap();
                                             ctx.request_repaint();
                                         },
@@ -379,6 +403,8 @@ pub mod client {
                 }
             });
 
+            event!(Level::INFO, "Starting client sender...");
+
             //Sender
             tokio::spawn(async move {
                 loop {
@@ -388,15 +414,24 @@ pub mod client {
                             if let Err(err) = send_stream.write_all(&Message(Some(MessageType::KeepAlive)).to_sendable()).await {
                                 event!(Level::ERROR, "Error occured while trying to write to the server: {err}");
                             }
+
+                            event!(Level::DEBUG, "Sent KeepAlive message to server.")
                         }
                         Some(message) = to_server_listener.recv() => {
-                            if let Err(err) = send_stream.write_all(&message.to_sendable()).await {
+                            if let Err(err) = send_stream.write_all(&message.clone().to_sendable()).await {
                                 event!(Level::ERROR, "Error occured while trying to write to the server: {err}");
                             }
+
+                            event!(Level::DEBUG, "Message sent to server: {message:?}");
                         },
                     }
                 }
             });
+
+            event!(
+                Level::INFO,
+                "Successfully established connection with remote address ({parsed_address})."
+            );
 
             Ok(ConnectionInstance {
                 file_trees: file_tree,
@@ -502,12 +537,20 @@ pub struct Message(pub Option<MessageType>);
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, strum::Display)]
 pub enum MessageType {
+    #[strum(to_string = "FileTreeRequest")]
     FileTreeRequest,
+    #[strum(to_string = "FileRequest({0})")]
     FileRequest(String),
 
+    #[strum(to_string = "FileResponse({0:?})")]
     FileResponse(FileReponseHeader),
+
+    #[strum(to_string = "FileTreeResponse")]
     FileTreeResponse(Vec<client::FileTree>),
+
+    #[strum(to_string = "FilePacket")]
     FilePacket(FilePacket),
+    #[strum(to_string = "KeepAlive")]
     KeepAlive,
 }
 
