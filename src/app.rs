@@ -1,15 +1,15 @@
-use std::{collections::HashMap, fs, io::Write, path::PathBuf};
+use std::{cmp::Ordering, collections::HashMap, fmt::Display, fs, io::Write, path::PathBuf};
 
+use chrono::{DateTime, Local};
 use egui::{vec2, Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_notify::{Toast, Toasts};
 use file_sharing::{
     client::{connect_to_server, ConnectionInstance, FileTree},
     server::start_server,
-    FileReponseHeader, Message,
+    DownloadHeader, Message,
 };
 use indexmap::IndexMap;
-use serde_json::value::Index;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, span, Level};
@@ -45,7 +45,10 @@ pub struct Application {
     #[serde(skip)]
     pub connection_sender: Sender<ConnectionInstance>,
 
-    pub download_header_list: IndexMap<String, (FileReponseHeader, Vec<usize>)>,
+    #[serde(skip)]
+    pub temporary_download_header_list: IndexMap<String, DownloadHeader>,
+
+    pub completed_download_header_list: IndexMap<String, DownloadHeader>,
 
     #[serde(skip)]
     pub download_location: HashMap<String, PathBuf>,
@@ -71,7 +74,8 @@ impl Default for Application {
             connection_reciver,
             connection_sender,
             remote_address: String::new(),
-            download_header_list: IndexMap::new(),
+            temporary_download_header_list: IndexMap::new(),
+            completed_download_header_list: IndexMap::new(),
             download_location: HashMap::new(),
         }
     }
@@ -105,7 +109,7 @@ impl eframe::App for Application {
             }
         }
 
-        //Create the top panel in the ui 
+        //Create the top panel in the ui
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 //The "Host" menu button
@@ -222,17 +226,18 @@ impl eframe::App for Application {
                 });
 
                 ui.menu_button("Download history", |ui| {
-                    TableBuilder::new(ui)
+                    ui.allocate_ui(vec2(300., 300.), |ui| {
+                        TableBuilder::new(ui)
                         .resizable(true)
-                        .auto_shrink([false, false])
+                        .auto_shrink([true, false])
                         .striped(true)
-                        .columns(Column::remainder().at_most(ctx.available_rect().width()), 4)
+                        .columns(Column::remainder().at_most(ctx.available_rect().width()), 5)
                         .header(25., |mut row| {
                             row.col(|ui| {
                                 ui.label("Download Name");
                             });
                             row.col(|ui| {
-                                ui.label("Download Identificator");
+                                ui.label("File Hash");
                             });
                             row.col(|ui| {
                                 ui.label("Download size (Bytes)");
@@ -240,30 +245,40 @@ impl eframe::App for Application {
                             row.col(|ui| {
                                 ui.label("Download packet count");
                             });
-                        }).body(|body| {
-                            let row_heights = vec![25. as f32; self.download_header_list.len()].into_iter();
+                            row.col(|ui| {
+                                ui.label("Date");
+                            });
+                        })
+                        .body(|body| {
+                            let row_heights =
+                                vec![25.; self.completed_download_header_list.len()].into_iter();
 
                             body.heterogeneous_rows(row_heights, |mut row| {
                                 let row_idx = row.index();
 
-                                let file_header= self.download_header_list[row_idx].0.clone();
+                                let download_header =
+                                    self.completed_download_header_list[row_idx].clone();
+
+                                let file_response = download_header.file_response.clone();
 
                                 row.col(|ui| {
-                                    ui.label(file_header.file_name);
-
+                                    ui.label(file_response.file_name);
                                 });
                                 row.col(|ui| {
-                                    ui.label(file_header.file_hash);
+                                    ui.label(file_response.file_hash);
                                 });
                                 row.col(|ui| {
-                                    ui.label(file_header.total_size.to_string());
+                                    ui.label(file_response.total_size.to_string());
                                 });
                                 row.col(|ui| {
-                                    ui.label(file_header.file_packet_count.to_string());
+                                    ui.label(file_response.file_packet_count.to_string());
+                                });
+                                row.col(|ui| {
+                                    ui.label(download_header.initiated_stamp.to_rfc2822());
                                 });
                             });
                         });
-                        
+                    });
                 });
             });
         });
@@ -272,7 +287,7 @@ impl eframe::App for Application {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone(), self.download_header_list.clone());
+                    let clicked_file_hash = display_file_tree(ui, self.file_trees.clone(), self.temporary_download_header_list.clone());
                     if let Some(connection_instance) = &mut self.connection_instance {
                         if let Some((file_hash, file_name)) = clicked_file_hash {
                             let (file_name, file_extension) =
@@ -301,9 +316,9 @@ impl eframe::App for Application {
                         {
                             match message {
                                 file_sharing::MessageType::FileResponse(file_reponse_header) => {
-                                    self.download_header_list.insert(
+                                    self.temporary_download_header_list.insert(
                                         file_reponse_header.packet_identificator.clone(),
-                                        (file_reponse_header, vec![]),
+                                        DownloadHeader { file_response: file_reponse_header, packet_list: vec![], arrived_bytes: 0, initiated_stamp: Local::now() },
                                     );
                                 }
                                 file_sharing::MessageType::FilePacket(packet) => {
@@ -311,21 +326,24 @@ impl eframe::App for Application {
 
                                     let packet_id = packet.parent_id;
 
-                                    let _spawn = span!(Level::ERROR, "FilePacketReciver");
+                                    let span = span!(Level::ERROR, "FilePacketReciver");
+                                    let _enter = span.enter();
 
-                                    if let Some((_header, packet_id_list)) =
-                                        self.download_header_list.get_mut(&packet_id)
+                                    if let Some(download_header) =
+                                        self.temporary_download_header_list.get_mut(&packet_id)
                                     {
-                                        packet_id_list.push(packet.packet_id);
+                                        download_header.packet_list.push(packet.packet_id);
 
-                                        should_delete_row = _header.file_packet_count as usize
-                                            == packet_id_list.len();
+                                        should_delete_row = download_header.file_response.file_packet_count as usize
+                                            == download_header.packet_list.len();
 
                                         if should_delete_row {
                                             self.toasts.add(Toast::success(format!(
                                                 "{} has finished downloading.",
-                                                _header.file_name
+                                                download_header.file_response.file_name
                                             )));
+
+                                            self.completed_download_header_list.insert(packet_id.clone(), download_header.clone());
                                         }
 
                                         if let Some(save_path) =
@@ -336,7 +354,7 @@ impl eframe::App for Application {
                                                 .append(true)
                                                 .open(save_path)
                                             {
-                                                file.write(&packet.bytes).unwrap();
+                                                download_header.arrived_bytes += file.write(&packet.bytes).unwrap();
                                             }
                                         }
                                     }
@@ -346,6 +364,7 @@ impl eframe::App for Application {
 
                                     if should_delete_row {
                                         self.download_location.remove(&packet.file_hash);
+                                        self.temporary_download_header_list.swap_remove(&packet_id);
                                     }
                                 }
                                 file_sharing::MessageType::KeepAlive => (),
@@ -372,14 +391,20 @@ fn display_error(err: impl ToString) {
         .show();
 }
 
-pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>, download_list: IndexMap<String, (FileReponseHeader, Vec<usize>)>) -> Option<(String, String)> {
+pub fn display_file_tree(
+    ui: &mut Ui,
+    file_trees: Vec<FileTree>,
+    download_list: IndexMap<String, DownloadHeader>,
+) -> Option<(String, String)> {
     for file_tree in file_trees {
         match &file_tree {
             FileTree::Folder((name, file_list)) => {
                 if let Some(Some(file_attr)) = ui
                     .collapsing(name, |ui| {
                         for entry in file_list {
-                            if let Some(file_attr) = display_file_tree(ui, vec![entry.clone()], download_list.clone()) {
+                            if let Some(file_attr) =
+                                display_file_tree(ui, vec![entry.clone()], download_list.clone())
+                            {
                                 return Some(file_attr);
                             }
                         }
@@ -391,19 +416,32 @@ pub fn display_file_tree(ui: &mut Ui, file_trees: Vec<FileTree>, download_list: 
                 }
             }
             FileTree::File((file_name, file_hash)) => {
-                return ui.horizontal(|ui| {
-                    if ui.button(file_name).clicked() {
-                        return Some((file_hash.to_string(), file_name.to_string()));
-                    };
+                return ui
+                    .horizontal(|ui| {
+                        if ui.button(file_name).clicked() {
+                            return Some((file_hash.to_string(), file_name.to_string()));
+                        };
 
-                    if let Some((file_response_header, packet_number_list)) = download_list.values().find(|entry| entry.0.file_hash == *file_hash) {
-                        ui.allocate_ui(vec2(200., ui.available_height()), |ui| {
-                            ui.add(egui::ProgressBar::new(packet_number_list.len() as f32 / file_response_header.file_packet_count as f32).show_percentage().text("Progress"))
-                        });
-                    }
+                        if let Some(download_header) = download_list
+                            .values()
+                            .find(|entry| entry.file_response.file_hash == *file_hash)
+                        {
+                            ui.allocate_ui(vec2(200., ui.available_height()), |ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(
+                                        download_header.packet_list.len() as f32
+                                            / download_header.file_response.file_packet_count
+                                                as f32,
+                                    )
+                                    .show_percentage()
+                                    .text(calculale_bandwidth_from_date_and_bytes(download_header.arrived_bytes, download_header.initiated_stamp).to_string()),
+                                )
+                            });
+                        }
 
-                    None
-                }).inner;
+                        None
+                    })
+                    .inner;
             }
             FileTree::Empty => {
                 ui.label("Empty");
@@ -467,4 +505,50 @@ pub fn folder_into_file_tree(
     }
 
     Ok((file_trees, shared_files))
+}
+
+pub fn calculale_bandwidth_from_date_and_bytes(bytes: usize, date: DateTime<Local>) -> Bandwidth {
+    let bytes_per_sec = bytes / (Local::now().signed_duration_since(date).num_seconds() as usize).clamp(1, usize::MAX);
+    let kbytes_per_sec = bytes_per_sec as f32 / 1024.;
+    let mbytes_per_sec = kbytes_per_sec as f32 / 1024.;
+    let mbits_per_sec = mbytes_per_sec * 8.;
+    
+    if mbits_per_sec > 1024. {
+        let gbytes_per_sec = mbytes_per_sec as f32 / 1024.;
+
+        let gbits_per_sec = gbytes_per_sec * 8.;
+
+        Bandwidth::GBPS(gbits_per_sec)        
+    }
+    else if mbits_per_sec < 1. {
+        let kbits_per_sec = kbytes_per_sec * 8.;
+
+        Bandwidth::KBPS(kbits_per_sec)
+    }
+    else {
+        Bandwidth::MBPS(mbits_per_sec)
+    }
+
+} 
+
+pub enum Bandwidth {
+    GBPS(f32),
+    MBPS(f32),
+    KBPS(f32)
+}
+
+impl Display for Bandwidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            Bandwidth::GBPS(num) => {
+                format!("{num} GBPS")
+            },
+            Bandwidth::MBPS(num) => {
+                format!("{num} MBPS")
+            },
+            Bandwidth::KBPS(num) => {
+                format!("{num} KBPS")
+            },
+        })
+    }
 }

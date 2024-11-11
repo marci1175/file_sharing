@@ -31,3 +31,5 @@ egui-notify = "0.17.0"
 criterion = "0.5.1"
 egui_extras = "0.29.1"
 indexmap = {version = "2.6.0", features = ["serde"]}
+strum = {version = "0.26.3", features = ["derive"]}
+chrono = {version = "0.4.38", features = ["serde"]}

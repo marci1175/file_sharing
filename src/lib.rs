@@ -1,4 +1,7 @@
+use std::mem;
+
 use anyhow::bail;
+use chrono::{DateTime, Local};
 use quinn::RecvStream;
 use tokio::io::AsyncReadExt;
 use tracing::instrument;
@@ -54,11 +57,19 @@ pub mod server {
         shared_files: HashMap<String, PathBuf>,
         file_tree: Vec<FileTree>,
     ) -> anyhow::Result<()> {
+        let span = span!(Level::DEBUG, "Server");
+        let _enter = span.enter();
+
         #[cfg(not(debug_assertions))]
         let addr = Ipv6Addr::UNSPECIFIED;
 
         #[cfg(debug_assertions)]
         let addr = Ipv6Addr::LOCALHOST;
+
+        event!(
+            Level::DEBUG,
+            r#"Starting server on local address: "{addr}"..."#
+        );
 
         let (server_config, _server_cert) = configure_server().unwrap();
 
@@ -67,12 +78,16 @@ pub mod server {
             std::net::SocketAddr::V6(SocketAddrV6::new(addr, port, 0, 0)),
         )?;
 
+        event!(Level::INFO, "Starting service workers...");
+
         spawn_service_workers(
             shared_files.clone(),
             Arc::new(endpoint),
             cancellation_token,
             file_tree,
         );
+
+        event!(Level::INFO, "Server startup complete.");
 
         Ok(())
     }
@@ -143,6 +158,7 @@ pub mod server {
 
                                                 match Message::try_from(buf.as_slice()) {
                                                     Ok(message) => {
+                                                        event!(Level::INFO, "Received message ({message:?}) from client: {remote_addr}.");
                                                         send.send(message).await.unwrap();
                                                     },
                                                     Err(err) => {
@@ -174,19 +190,23 @@ pub mod server {
                                                             }
                                                         },
                                                         crate::MessageType::FileRequest(file_hash) => {
+                                                            event!(Level::INFO, "Client has requested a file: {file_hash}");
                                                             if let Some(file_path) = shared_files.get(&file_hash) {
+                                                                event!(Level::INFO, "Client has requested a shared file available at: {}", file_path.as_os_str().to_string_lossy());
                                                                 let mut file_handle = File::open(file_path).await.unwrap();
 
                                                                 let file_metadata = file_handle.metadata().await.unwrap();
 
+                                                                let file_length = file_metadata.len();
+
                                                                 let packet_length = MESSAGE_LENGTH_LIMIT / 2;
-                                                                let packet_count = file_metadata.len() / packet_length + 1;
+                                                                let packet_count =  file_length / packet_length + 1;
                                                                 let parent_header_id = Uuid::new_v4();
 
                                                                 let file_header = FileReponseHeader {
                                                                     file_name: file_path.file_name().unwrap().to_string_lossy().to_string(),
                                                                     file_hash: file_hash.clone(),
-                                                                    total_size: file_metadata.len(),
+                                                                    total_size: file_length,
                                                                     file_packets: vec![],
                                                                     file_packet_count: packet_count,
                                                                     packet_identificator: parent_header_id.to_string(),
@@ -196,10 +216,12 @@ pub mod server {
                                                                     event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                 }
 
+                                                                event!(Level::DEBUG, "Sending {packet_count} packets of bytes. With a total of {file_length} bytes.");
+
                                                                 for packet_number in 0..packet_count {
-                                                                    let mut buf = if packet_number + 1 == packet_count || file_metadata.len() < packet_length {
+                                                                    let mut buf = if packet_number + 1 == packet_count || file_length < packet_length {
                                                                         let cursor_pos = file_handle.stream_position().await.unwrap();
-                                                                        vec![0; (file_metadata.len() - cursor_pos) as usize]
+                                                                        vec![0; (file_length - cursor_pos) as usize]
                                                                     }
                                                                     else {
                                                                         vec![0; packet_length as usize]
@@ -211,6 +233,15 @@ pub mod server {
                                                                         event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                     }
                                                                 }
+
+                                                                event!(Level::DEBUG, "Finished sending all the bytes of {file_hash} for: {remote_addr}.")
+                                                            }
+                                                            //If the file the client was not found we should indicate it by sending a ```None``` back.
+                                                            else {
+                                                                event!(Level::ERROR, "Client has requested a file which is not shared by the server.");
+                                                                if let Err(err) = send_stream.write_all(&Message(None).to_sendable()).await {
+                                                                    event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                };
                                                             }
                                                         },
                                                         crate::MessageType::KeepAlive => {
@@ -469,7 +500,7 @@ pub mod client {
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct Message(pub Option<MessageType>);
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, strum::Display)]
 pub enum MessageType {
     FileTreeRequest,
     FileRequest(String),
@@ -499,7 +530,9 @@ pub struct FilePacket {
     pub bytes: Vec<u8>,
 }
 
+/// The Sendable traits implements functions for being able to turn the `Struct` into Bytes.
 trait Sendable {
+    /// This function serializes `self` with rmp_serde and returns the Bytes.
     fn to_sendable(self) -> Vec<u8>;
 }
 
@@ -508,10 +541,10 @@ impl Sendable for Message {
         let mut buf: Vec<u8> = Vec::with_capacity(size_of::<usize>() + size_of::<Self>());
 
         if let Some(MessageType::FilePacket(file_packet)) = &mut self.0 {
-            let bytes = file_packet.bytes.clone();
+            let bytes = mem::take(&mut file_packet.bytes);
 
-            file_packet.bytes = vec![];
             let message = rmp_serde::to_vec(&self).unwrap();
+
             buf.extend(message.len().to_be_bytes().to_vec());
             buf.extend(message);
             buf.extend(bytes);
@@ -533,7 +566,6 @@ impl TryFrom<&[u8]> for Message {
     }
 }
 
-#[instrument]
 pub async fn read_message_length(recv: &mut RecvStream) -> anyhow::Result<u64> {
     let message_length = recv.read_u64().await?;
 
@@ -542,4 +574,17 @@ pub async fn read_message_length(recv: &mut RecvStream) -> anyhow::Result<u64> {
     } else {
         Ok(message_length)
     }
+}
+
+/// Stores information about a download.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+pub struct DownloadHeader {
+    /// The file's `FileResponseHeader`.
+    pub file_response: FileReponseHeader,
+    /// The list of the arrived `FilePacket`'s packet_id.
+    pub packet_list: Vec<usize>,
+    /// Arrived byte count.
+    pub arrived_bytes: usize,
+    /// The timestamp when this instance of `DownloadHeader` got initiated.
+    pub initiated_stamp: DateTime<Local>,
 }
