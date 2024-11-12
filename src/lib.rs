@@ -1,16 +1,16 @@
-use std::mem;
+use std::{fs::Metadata, mem, path::PathBuf};
 
 use anyhow::bail;
 use chrono::{DateTime, Local};
 use quinn::RecvStream;
-use tokio::io::AsyncReadExt;
-use tracing::instrument;
+use tokio::{fs::File, io::AsyncReadExt};
 
 pub const MESSAGE_LENGTH_LIMIT: u64 = 128000000; // Bytes
 
 pub mod server {
     use std::{
         collections::HashMap,
+        io::{Read, Seek},
         net::{Ipv6Addr, SocketAddrV6},
         path::PathBuf,
         sync::Arc,
@@ -25,14 +25,15 @@ pub mod server {
         fs::File,
         io::{AsyncReadExt, AsyncSeekExt},
         select,
+        sync::Mutex,
     };
     use tokio_util::sync::CancellationToken;
     use tracing::{event, span, Level};
     use uuid::Uuid;
 
     use crate::{
-        client::FileTree, read_message_length, FileReponseHeader, Message, Sendable,
-        MESSAGE_LENGTH_LIMIT,
+        client::FileTree, get_file_handle, read_message_length, FileReponseHeader, Message,
+        Sendable, MESSAGE_LENGTH_LIMIT,
     };
 
     /// Creates a custom ```(ServerConfig, CertificateDer<'static>)``` instance. The Certificate is insecure.
@@ -56,7 +57,7 @@ pub mod server {
         cancellation_token: CancellationToken,
         shared_files: HashMap<String, PathBuf>,
         file_tree: Vec<FileTree>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Ipv6Addr> {
         #[cfg(not(debug_assertions))]
         let addr = Ipv6Addr::UNSPECIFIED;
 
@@ -86,7 +87,7 @@ pub mod server {
 
         event!(Level::INFO, "Server startup complete.");
 
-        Ok(())
+        Ok(addr)
     }
 
     pub fn spawn_service_workers(
@@ -172,7 +173,10 @@ pub mod server {
 
                                 // Spawn client sender
                                 tokio::spawn(async move {
+                                    let send_stream = Arc::new(Mutex::new(send_stream));
                                     loop {
+                                        let send_stream = send_stream.clone();
+
                                         select! {
                                             _ = cancellation_token_clone_2.cancelled() => break,
 
@@ -180,7 +184,7 @@ pub mod server {
                                                 if let Message(Some(message)) = received_message.clone() {
                                                     match message {
                                                         crate::MessageType::FileTreeRequest => {
-                                                            if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileTreeResponse(file_tree.clone()))).to_sendable()).await {
+                                                            if let Err(err) = send_stream.lock().await.write_all(&Message(Some(crate::MessageType::FileTreeResponse(file_tree.clone()))).to_sendable()).await {
                                                                 event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                             }
                                                         },
@@ -188,11 +192,10 @@ pub mod server {
                                                             event!(Level::INFO, "Client has requested a file: {file_hash}");
                                                             if let Some(file_path) = shared_files.get(&file_hash) {
                                                                 event!(Level::INFO, "Client has requested a shared file available at: {}", file_path.as_os_str().to_string_lossy());
-                                                                let mut file_handle = File::open(file_path).await.unwrap();
 
-                                                                let file_metadata = file_handle.metadata().await.unwrap();
-
-                                                                let file_length = file_metadata.len();
+                                                                match get_file_handle(file_path.to_path_buf()) {
+                                                                    Ok((mut file_handle, file_metadata)) => {
+                                                                        let file_length = file_metadata.len();
 
                                                                 let packet_length = MESSAGE_LENGTH_LIMIT / 2;
                                                                 let packet_count =  file_length / packet_length + 1;
@@ -207,42 +210,62 @@ pub mod server {
                                                                     packet_identificator: parent_header_id.to_string(),
                                                                 };
 
-                                                                if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FileResponse(file_header.clone()))).to_sendable()).await {
+                                                                if let Err(err) = send_stream.lock().await.write_all(&Message(Some(crate::MessageType::FileResponse(file_header.clone()))).to_sendable()).await {
                                                                     event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                 }
 
                                                                 event!(Level::INFO, "Sending file header packet: {file_header:?}");
                                                                 event!(Level::INFO, "Sending {packet_count} packets of bytes. With a total of {file_length} bytes.");
 
-                                                                for packet_number in 0..packet_count {
-                                                                    let mut buf = if packet_number + 1 == packet_count || file_length < packet_length {
-                                                                        let cursor_pos = file_handle.stream_position().await.unwrap();
-                                                                        vec![0; (file_length - cursor_pos) as usize]
-                                                                    }
-                                                                    else {
-                                                                        vec![0; packet_length as usize]
-                                                                    };
+                                                                let file_hash_clone = file_hash.clone();
 
-                                                                    file_handle.read_exact(&mut buf).await.unwrap();
+                                                                tokio::spawn(async move {
+                                                                    for packet_number in 0..packet_count {
+                                                                        let mut buf = if packet_number + 1 == packet_count || file_length < packet_length {
+                                                                            let cursor_pos = file_handle.stream_position().unwrap();
+                                                                            vec![0; (file_length - cursor_pos) as usize]
+                                                                        }
+                                                                        else {
+                                                                            vec![0; packet_length as usize]
+                                                                        };
 
-                                                                    if let Err(err) = send_stream.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket {file_hash:file_hash.clone(),packet_id:packet_number as usize,parent_id:parent_header_id.to_string(), bytes_length: buf.len(), bytes:buf }))).to_sendable()).await {
-                                                                        event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                        file_handle.read_exact(&mut buf).unwrap();
+
+                                                                        if let Err(err) = send_stream.lock().await.write_all(&Message(Some(crate::MessageType::FilePacket(crate::FilePacket {
+                                                                            file_hash: file_hash_clone.clone(),
+                                                                            packet_id: packet_number as usize,
+                                                                            parent_id: parent_header_id.to_string(),
+                                                                            bytes_length: buf.len(),
+                                                                            bytes:buf
+                                                                        }))).to_sendable()).await {
+                                                                            event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                        }
                                                                     }
-                                                                }
+                                                                });
 
                                                                 event!(Level::INFO, "Finished sending all the bytes of {file_hash} for: {remote_addr}.")
+                                                                    },
+                                                                    Err(_) => {
+                                                                        event!(Level::ERROR, "Client has requested a file which is doesn't exist on the server.");
+                                                                        if let Err(err) = send_stream.lock().await.write_all(&Message(None).to_sendable()).await {
+                                                                            event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                                        }
+                                                                    },
+                                                                }
+
+
                                                             }
                                                             //If the file the client was not found we should indicate it by sending a ```None``` back.
                                                             else {
                                                                 event!(Level::ERROR, "Client has requested a file which is not shared by the server.");
-                                                                if let Err(err) = send_stream.write_all(&Message(None).to_sendable()).await {
+                                                                if let Err(err) = send_stream.lock().await.write_all(&Message(None).to_sendable()).await {
                                                                     event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                                 };
                                                             }
                                                         },
                                                         crate::MessageType::KeepAlive => {
                                                             //Echo back to client
-                                                            if let Err(err) = send_stream.write_all(&received_message.to_sendable()).await {
+                                                            if let Err(err) = send_stream.lock().await.write_all(&received_message.to_sendable()).await {
                                                                 event!(Level::ERROR, "Error occured while writing to a client: {err}.")
                                                             }
 
@@ -251,6 +274,11 @@ pub mod server {
                                                         crate::MessageType::FileResponse(_) => unreachable!(),
                                                         crate::MessageType::FilePacket(_) => unreachable!(),
                                                     }
+                                                }
+                                                else {
+                                                        if let Err(err) = send_stream.lock().await.write_all(&Message(Some(crate::MessageType::FileTreeResponse(file_tree.clone()))).to_sendable()).await {
+                                                            event!(Level::ERROR, "Error occured while writing to a client: {err}.")
+                                                        }
                                                 }
                                             }
                                         }
@@ -630,4 +658,12 @@ pub struct DownloadHeader {
     pub arrived_bytes: usize,
     /// The timestamp when this instance of `DownloadHeader` got initiated.
     pub initiated_stamp: DateTime<Local>,
+}
+
+pub fn get_file_handle(file_path: PathBuf) -> anyhow::Result<(std::fs::File, Metadata)> {
+    let file_handle = std::fs::File::open(file_path)?;
+
+    let file_metadata = file_handle.metadata()?;
+
+    Ok((file_handle, file_metadata))
 }

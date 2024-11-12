@@ -102,10 +102,14 @@ impl eframe::App for Application {
         self.toasts.show(ctx);
 
         //Get the folder's item every repaint
-        if let Ok((file_trees, shared_files)) = folder_into_file_tree(self.shared_folders.clone()) {
-            if self.file_trees != file_trees {
-                self.file_trees = file_trees;
-                self.shared_files = shared_files;
+        if self.server_instance.is_some() {
+            if let Ok((file_trees, shared_files)) =
+                folder_into_file_tree(self.shared_folders.clone())
+            {
+                if self.file_trees != file_trees {
+                    self.file_trees = file_trees;
+                    self.shared_files = shared_files;
+                }
             }
         }
 
@@ -335,7 +339,7 @@ impl eframe::App for Application {
 
                                             should_delete_row = download_header.file_response.file_packet_count as usize
                                                 == download_header.packet_list.len();
-                                                
+
                                             if should_delete_row {
                                                 self.toasts.add(Toast::success(format!(
                                                     "{} has finished downloading.",
@@ -365,6 +369,9 @@ impl eframe::App for Application {
                                         }
                                     }
                                     file_sharing::MessageType::KeepAlive => (),
+                                    file_sharing::MessageType::FileTreeResponse(file_trees) => {
+                                        self.file_trees = file_trees;
+                                    }
                                     _ => unreachable!(),
                                 }
                             }
@@ -444,7 +451,7 @@ pub fn display_file_tree(
                                         )
                                         .show_percentage()
                                         .text(
-                                            calculale_bandwidth_from_date_and_bytes(
+                                            calculate_bandwidth_from_date_and_bytes(
                                                 download_header.arrived_bytes,
                                                 download_header.initiated_stamp,
                                             )
@@ -532,7 +539,7 @@ pub fn folder_into_file_tree(
     Ok((file_trees, shared_files))
 }
 
-pub fn calculale_bandwidth_from_date_and_bytes(bytes: usize, date: DateTime<Local>) -> Bandwidth {
+pub fn calculate_bandwidth_from_date_and_bytes(bytes: usize, date: DateTime<Local>) -> Bandwidth {
     let bytes_per_sec = bytes
         / (Local::now().signed_duration_since(date).num_seconds() as usize).clamp(1, usize::MAX);
     let kbytes_per_sec = bytes_per_sec as f32 / 1024.;
